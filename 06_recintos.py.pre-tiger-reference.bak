@@ -1,0 +1,741 @@
+# -*- coding: utf-8 -*-
+"""
+============================================================
+ZOOLOGICO NICOLAS BRAVO - MODULO 06 - RECINTOS
+============================================================
+Habitats y cercados como mallas 3D procedurales:
+  - "hex"       : recinto hexagonal (como los de la zona sur-oeste en la
+                  vista satelital) con piso, bordillo, cerca, refugio y rocas.
+  - "rect"      : recinto rectangular (cerca baja o jaula alta con techo).
+  - "estanque"  : estanque poligonal con agua, borde de rocas y cerca baja.
+
+COMO SE UBICAN (igual que el módulo 05)
+  Cada recinto se ANCLA a un camino real de 03 (CAMINO_xxx):
+  fracción de recorrido (t), lado, y distancia al borde. También se admite:
+      pos=(x, y), yaw=grados      posición absoluta
+  El FRENTE (puerta) de cada recinto mira hacia el camino. Si el sitio no es
+  válido el script prueba desplazamientos y el lado opuesto; si no encuentra
+  sitio, OMITE el recinto (nunca queda sobre un camino ni sobre un edificio).
+
+REGLAS (un recinto NO se coloca...)
+  - fuera del contorno de 01, ni sobre la explanada de 02,
+  - sobre caminos de 03, ni sobre estructuras de 05, ni sobre otro recinto.
+
+SALIDA PARA EL MODULO 07
+  Cada objeto REC_xxx guarda propiedades personalizadas (puerta_x, puerta_y,
+  yaw, ancho_puerta, rotulo, ...) para que 07 ponga letreros en la puerta.
+
+IMPORTANTE
+  Cantidad, tipo, tamaño y posición de RECINTOS son una PROPUESTA PRELIMINAR
+  (no pude abrir el Figma). Cámbialos por los recintos reales del zoológico.
+
+ORDEN: 01 -> 02 -> 03 -> 05 -> 06 -> 07 -> 04. Es seguro repetir este
+script: solo reconstruye 06_RECINTOS.
+Solo API de datos (sin bpy.ops). Pensado para Blender 3.x/4.x.
+============================================================
+"""
+
+import bpy
+import bmesh
+import math
+import random
+from mathutils import Vector, kdtree
+
+# ============================================================
+# 1. CONFIGURACION
+# ============================================================
+COLLECTION_NAME = "06_RECINTOS"
+BASE_OBJECT_NAME = "BASE_ZOOLOGICO_NICOLAS_BRAVO"
+TERRAIN_COLLECTIONS = ["01_BASE_TERRENO", "02_SUPERFICIES"]
+SURFACE_COLLECTION = "02_SUPERFICIES"
+ROADS_COLLECTION = "03_CAMINOS"
+OBSTACLE_PREFIXES = ("05_",)          # estructuras que no se pisan
+
+FALLBACK_OUTLINE = [
+    (-35, 80), (30, 65), (22, 40), (70, 25), (70, -15), (20, -40),
+    (12, -65), (-5, -90), (-75, -88), (-75, -48), (-5, -45), (-5, -5),
+    (-65, 0), (-65, 30), (-45, 65),
+]
+FALLBACK_GROUND_Z = 1.5
+RAY_START_Z = 500.0
+
+GLOBAL_SCALE = 1.0       # multiplica las dimensiones de TODOS los recintos
+ROAD_CLEAR = 1.5         # holgura mínima al borde de un camino (m)
+OUTLINE_MARGIN = 1.0
+SURFACE_MARGIN = 1.0
+REC_GAP = 1.5            # separación mínima entre recintos
+OBSTACLE_MARGIN = 1.5
+MAX_OBSTACLE_SIZE = 80.0
+GATE_WIDTH = 2.2         # ancho de la puerta (m)
+CURB_H = 0.5             # altura del bordillo sobre el piso
+
+TRY_EXTRA_DISTANCE = (0.0, 1.0, 2.0, 3.0, 5.0)
+TRY_SHIFT_ALONG = (0, 3, -3, 6, -6, 9, -9, 12, -12, 16, -16)
+
+# ============================================================
+# 2. MATERIALES: nombre: (color, rugosidad, alfa)
+# ============================================================
+MATERIALES = {
+    "Rec_Tierra":   ((0.45, 0.33, 0.20), 0.95, 1.0),
+    "Rec_Pasto":    ((0.28, 0.42, 0.16), 0.95, 1.0),
+    "Rec_Arena":    ((0.70, 0.60, 0.40), 0.95, 1.0),
+    "Rec_Agua":     ((0.08, 0.26, 0.38), 0.05, 0.85),
+    "Rec_Bordillo": ((0.60, 0.58, 0.54), 0.90, 1.0),
+    "Rec_Cerca":    ((0.16, 0.18, 0.18), 0.55, 1.0),
+    "Rec_Malla":    ((0.25, 0.27, 0.28), 0.60, 0.25),
+    "Rec_Madera":   ((0.25, 0.14, 0.07), 0.80, 1.0),
+    "Rec_Roca":     ((0.40, 0.38, 0.35), 0.95, 1.0),
+    "Rec_Refugio":  ((0.80, 0.74, 0.60), 0.85, 1.0),
+    "Rec_Techo":    ((0.48, 0.18, 0.10), 0.80, 1.0),
+}
+
+# ============================================================
+# 3. RECINTOS (PROPUESTA PRELIMINAR - NO CONFIRMADA)
+# ============================================================
+# Campos comunes:
+#   name, rotulo (texto del letrero que usará 07), forma, ancla | pos
+#   altura  : altura de la cerca (m)         rieles : nº de rieles horizontales
+#   poste_sep: separación de postes (m)      suelo  : material del piso
+#   refugio : True/False                     rocas  : cantidad de rocas
+#   techo   : True = jaula con techo         bebedero: True/False
+# hex      : R (radio, m)
+# rect     : w (ancho), d (fondo)
+# estanque : R (radio), lados (por defecto 12)
+# ancla = dict(camino="RAMAL_SUROESTE", t=0.2, lado=-1, distancia=3.0)
+#   lado +1 = izquierda según el sentido del camino, -1 = derecha
+RECINTOS = [
+    # --- Zona sur-oeste: recintos hexagonales (vista satelital) ---
+    dict(name="HEX_SUR_1", rotulo="Recinto 1", forma="hex", R=6.5, altura=2.2, rieles=3,
+         poste_sep=2.0, suelo="Rec_Tierra", refugio=True, rocas=4,
+         ancla=dict(camino="RAMAL_SUROESTE", t=0.22, lado=-1, distancia=3.0)),
+    dict(name="HEX_SUR_2", rotulo="Recinto 2", forma="hex", R=6.5, altura=2.2, rieles=3,
+         poste_sep=2.0, suelo="Rec_Tierra", refugio=True, rocas=4,
+         ancla=dict(camino="RAMAL_SUROESTE", t=0.52, lado=-1, distancia=3.0)),
+    dict(name="HEX_SUR_3", rotulo="Recinto 3", forma="hex", R=6.0, altura=2.2, rieles=3,
+         poste_sep=2.0, suelo="Rec_Pasto", refugio=True, rocas=3,
+         ancla=dict(camino="RAMAL_SUROESTE", t=0.80, lado=-1, distancia=3.0)),
+    dict(name="HEX_SUR_4", rotulo="Recinto 4", forma="hex", R=5.5, altura=2.2, rieles=3,
+         poste_sep=2.0, suelo="Rec_Tierra", refugio=True, rocas=3,
+         ancla=dict(camino="RAMAL_SUROESTE", t=0.40, lado=+1, distancia=3.0)),
+    dict(name="HEX_CENTRAL", rotulo="Recinto 5", forma="hex", R=8.0, altura=2.4, rieles=4,
+         poste_sep=2.0, suelo="Rec_Pasto", refugio=True, rocas=6,
+         ancla=dict(camino="AV_PRINCIPAL", t=0.45, lado=-1, distancia=6.0)),
+
+    # --- Zona noroeste: jaulas altas con techo (aves/primates) ---
+    dict(name="JAULA_NOROESTE_1", rotulo="Aviario 1", forma="rect", w=8.0, d=6.0,
+         altura=4.0, rieles=2, poste_sep=1.0, suelo="Rec_Tierra", techo=True,
+         refugio=False, rocas=2, bebedero=False,
+         ancla=dict(camino="SENDERO_NORTE", t=0.50, lado=+1, distancia=3.0)),
+    dict(name="JAULA_NOROESTE_2", rotulo="Aviario 2", forma="rect", w=8.0, d=6.0,
+         altura=4.0, rieles=2, poste_sep=1.0, suelo="Rec_Tierra", techo=True,
+         refugio=False, rocas=2, bebedero=False,
+         ancla=dict(camino="ANILLO_NOROESTE", t=0.20, lado=+1, distancia=3.0)),
+
+    # --- Zona este: recintos amplios y estanques ---
+    dict(name="RECINTO_ESTE", rotulo="Recinto Este", forma="rect", w=14.0, d=10.0,
+         altura=2.0, rieles=3, poste_sep=2.0, suelo="Rec_Pasto", refugio=True, rocas=5,
+         ancla=dict(camino="RAMAL_ESTE", t=0.80, lado=+1, distancia=3.0)),
+    dict(name="ESTANQUE_1", rotulo="Estanque 1", forma="estanque", R=5.0, altura=1.0,
+         rieles=2, poste_sep=2.5, suelo="Rec_Pasto", agua=True, refugio=False, rocas=8,
+         bebedero=False,
+         ancla=dict(camino="RAMAL_ESTE", t=0.35, lado=-1, distancia=3.0)),
+    dict(name="ESTANQUE_2", rotulo="Estanque 2", forma="estanque", R=4.0, altura=1.0,
+         rieles=2, poste_sep=2.5, suelo="Rec_Pasto", agua=True, refugio=False, rocas=6,
+         bebedero=False,
+         ancla=dict(camino="RAMAL_ESTE_RETORNO", t=0.50, lado=-1, distancia=3.0)),
+]
+
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+
+
+# ============================================================
+# 4. GEOMETRIA 2D
+# ============================================================
+def point_seg_dist(p, a, b):
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    l2 = abx * abx + aby * aby
+    u = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / l2))
+    return math.hypot(p[0] - (a[0] + abx * u), p[1] - (a[1] + aby * u))
+
+
+def point_in_poly(x, y, poly):
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def dist_to_poly_edges(p, poly):
+    return min(point_seg_dist(p, poly[i], poly[(i + 1) % len(poly)]) for i in range(len(poly)))
+
+
+def poly_area(poly):
+    s = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def rot(x, y, yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return x * c - y * s, x * s + y * c
+
+
+def rect_poly(cx, cy, w, d, yaw, grow=0.0):
+    hw, hd = w / 2.0 + grow, d / 2.0 + grow
+    out = []
+    for lx, ly in ((-hw, -hd), (hw, -hd), (hw, hd), (-hw, hd)):
+        rx, ry = rot(lx, ly, yaw)
+        out.append((cx + rx, cy + ry))
+    return out
+
+
+def rect_samples(cx, cy, w, d, yaw, step=1.5):
+    nx = max(2, int(w / step) + 1)
+    ny = max(2, int(d / step) + 1)
+    pts = []
+    for i in range(nx):
+        for j in range(ny):
+            lx = -w / 2.0 + w * i / (nx - 1)
+            ly = -d / 2.0 + d * j / (ny - 1)
+            rx, ry = rot(lx, ly, yaw)
+            pts.append((cx + rx, cy + ry))
+    return pts
+
+
+def rects_overlap(a, b, gap):
+    pb = rect_poly(b[0], b[1], b[2], b[3], b[4], gap)
+    for (x, y) in rect_samples(*a):
+        if point_in_poly(x, y, pb):
+            return True
+    pa = rect_poly(a[0], a[1], a[2], a[3], a[4], gap)
+    for (x, y) in rect_samples(*b):
+        if point_in_poly(x, y, pa):
+            return True
+    return False
+
+
+def scale_poly(poly, k):
+    return [(x * k, y * k) for x, y in poly]
+
+
+def regular_poly(R, n):
+    """Polígono regular CCW con la arista 0 centrada hacia +Y (el frente)."""
+    return [(R * math.cos(math.radians(90 - 180.0 / n + 360.0 * k / n)),
+             R * math.sin(math.radians(90 - 180.0 / n + 360.0 * k / n))) for k in range(n)]
+
+
+# ============================================================
+# 5. CAMINOS (lectura de 03; mismo formato que usa 05)
+# ============================================================
+def road_stations(obj):
+    verts = obj.data.vertices
+    n = len(verts)
+    if n % 9 != 0 or n < 18:
+        return None
+    mw = obj.matrix_world
+    out = []
+    for i in range(n // 9):
+        c = mw @ verts[i * 9 + 4].co
+        r = mw @ verts[i * 9].co
+        l = mw @ verts[i * 9 + 8].co
+        dx, dy = l.x - r.x, l.y - r.y
+        ln = math.hypot(dx, dy) or 1.0
+        out.append((c.x, c.y, dx / ln, dy / ln))
+    return out
+
+
+class RoadInfo:
+    def __init__(self, name, stations, hw):
+        self.name, self.st, self.hw = name, stations, hw
+        self.cum = [0.0]
+        for a, b in zip(stations, stations[1:]):
+            self.cum.append(self.cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        self.total = self.cum[-1]
+
+    def pose(self, s):
+        s = max(0.0, min(self.total, s))
+        j = 0
+        while j < len(self.cum) - 2 and self.cum[j + 1] < s:
+            j += 1
+        seg = (self.cum[j + 1] - self.cum[j]) or 1.0
+        u = (s - self.cum[j]) / seg
+        a, b = self.st[j], self.st[j + 1]
+        x = a[0] + (b[0] - a[0]) * u
+        y = a[1] + (b[1] - a[1]) * u
+        nx = a[2] + (b[2] - a[2]) * u
+        ny = a[3] + (b[3] - a[3]) * u
+        ln = math.hypot(nx, ny) or 1.0
+        return x, y, nx / ln, ny / ln
+
+
+def collect_roads():
+    col = bpy.data.collections.get(ROADS_COLLECTION)
+    infos, pts, hws = {}, [], []
+    if col is not None:
+        for o in col.objects:
+            if o.type == 'MESH' and o.name.startswith("CAMINO_"):
+                hw = float(o.get("ancho", 4.0)) / 2.0
+                st = road_stations(o)
+                if st is None:
+                    warn("%s: perfil distinto de 9 vértices; se usa como obstáculo aproximado." % o.name)
+                    mw = o.matrix_world
+                    for v in o.data.vertices:
+                        w = mw @ v.co
+                        pts.append((w.x, w.y))
+                        hws.append(0.0)
+                    continue
+                infos[o.name[len("CAMINO_"):]] = RoadInfo(o.name, st, hw)
+                for (cx, cy, _a, _b) in st:
+                    pts.append((cx, cy))
+                    hws.append(hw)
+    if not pts:
+        warn("No hay caminos en '%s'. Ejecuta 03 antes que 06." % ROADS_COLLECTION)
+        return None, infos
+    kd = kdtree.KDTree(len(pts))
+    for i, (x, y) in enumerate(pts):
+        kd.insert((x, y, 0.0), i)
+    kd.balance()
+    return (kd, hws, max(hws)), infos
+
+
+def road_free(index, x, y, clear):
+    if index is None:
+        return True
+    kd, hws, hmax = index
+    for (_co, i, d) in kd.find_range((x, y, 0.0), hmax + clear + 0.1):
+        if d < hws[i] + clear + 0.1:
+            return False
+    return True
+
+
+# ============================================================
+# 6. ESCENA
+# ============================================================
+def get_outline():
+    obj = bpy.data.objects.get(BASE_OBJECT_NAME)
+    if obj and obj.type == 'MESH':
+        nv = len(obj.data.vertices)
+        if nv >= 6 and nv % 2 == 0:
+            mw = obj.matrix_world
+            return [((mw @ v.co).x, (mw @ v.co).y) for v in obj.data.vertices[nv // 2:]]
+    warn("No se encontró el objeto base de 01: se usa el contorno de respaldo.")
+    return list(FALLBACK_OUTLINE)
+
+
+def make_ground():
+    objs = []
+    for cname in TERRAIN_COLLECTIONS:
+        col = bpy.data.collections.get(cname)
+        if col is None:
+            warn("Colección de suelo no encontrada: '%s'." % cname)
+            continue
+        objs.extend(o for o in col.all_objects if o.type == 'MESH')
+    data = []
+    for o in objs:
+        inv = o.matrix_world.inverted()
+        data.append((o, inv, (inv.to_3x3() @ Vector((0, 0, -1))).normalized()))
+
+    def ground(x, y):
+        best = None
+        for o, inv, dloc in data:
+            hit, loc, _n, _i = o.ray_cast(inv @ Vector((x, y, RAY_START_Z)), dloc)
+            if hit:
+                z = (o.matrix_world @ loc).z
+                if best is None or z > best:
+                    best = z
+        return best if best is not None else FALLBACK_GROUND_Z
+
+    return ground
+
+
+def collect_surface_polys():
+    polys = []
+    col = bpy.data.collections.get(SURFACE_COLLECTION)
+    if col is None:
+        return polys
+    for o in col.all_objects:
+        if o.type != 'MESH':
+            continue
+        mw = o.matrix_world
+        for f in o.data.polygons:
+            if abs(f.normal.z) < 0.5:
+                continue
+            polys.append([((mw @ o.data.vertices[i].co).x, (mw @ o.data.vertices[i].co).y)
+                          for i in f.vertices])
+    return polys
+
+
+def collect_obstacles():
+    obs = []
+    for col in bpy.data.collections:
+        if col.name.startswith(OBSTACLE_PREFIXES):
+            for o in col.all_objects:
+                if o.type != 'MESH':
+                    continue
+                cs = [o.matrix_world @ Vector(c) for c in o.bound_box]
+                xs, ys = [c.x for c in cs], [c.y for c in cs]
+                if max(max(xs) - min(xs), max(ys) - min(ys)) > MAX_OBSTACLE_SIZE:
+                    continue
+                obs.append((o.name, (min(xs), min(ys), max(xs), max(ys))))
+    return obs
+
+
+def simple_material(name, color, rough, alpha=1.0):
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = tuple(color) + (1.0,)
+        bsdf.inputs["Roughness"].default_value = rough
+        if alpha < 1.0 and "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = alpha
+    if alpha < 1.0:
+        try:
+            mat.blend_method = 'BLEND'
+        except Exception:
+            pass
+    mat.diffuse_color = tuple(color) + (alpha,)
+    return mat
+
+
+def clear_collection(col):
+    metas = set()
+    for o in list(col.objects):
+        if o.data is not None:
+            metas.add(o.data)
+        bpy.data.objects.remove(o, do_unlink=True)
+    for d in metas:
+        if d.users == 0 and isinstance(d, bpy.types.Mesh):
+            bpy.data.meshes.remove(d)
+
+
+# ============================================================
+# 7. MODELADO (bmesh). Coordenadas locales: centro en (0, 0), suelo z = 0,
+#    FRENTE (puerta) hacia +Y.
+# ============================================================
+class Slots:
+    def __init__(self):
+        self.names = []
+
+    def idx(self, name):
+        if name not in self.names:
+            self.names.append(name)
+        return self.names.index(name)
+
+
+def box(bm, x0, y0, z0, x1, y1, z1, mat):
+    v = [bm.verts.new(p) for p in ((x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                                   (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1))]
+    for f in ((0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)):
+        bm.faces.new([v[i] for i in f]).material_index = mat
+
+
+def beam(bm, a, b, z0, z1, thick, mat):
+    """Prisma horizontal entre los puntos a y b (rieles y bordillos)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return
+    nx, ny = -dy / L * thick / 2.0, dx / L * thick / 2.0
+    pts = [(a[0] - nx, a[1] - ny), (b[0] - nx, b[1] - ny), (b[0] + nx, b[1] + ny), (a[0] + nx, a[1] + ny)]
+    v = [bm.verts.new((p[0], p[1], z0)) for p in pts] + [bm.verts.new((p[0], p[1], z1)) for p in pts]
+    for f in ((0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)):
+        bm.faces.new([v[i] for i in f]).material_index = mat
+
+
+def prism(bm, poly, z0, z1, mat):
+    """Losa cerrada con la forma del polígono (piso, agua, techo de jaula)."""
+    n = len(poly)
+    vb = [bm.verts.new((x, y, z0)) for x, y in poly]
+    vt = [bm.verts.new((x, y, z1)) for x, y in poly]
+    bm.faces.new(list(reversed(vb))).material_index = mat
+    bm.faces.new(vt).material_index = mat
+    for i in range(n):
+        j = (i + 1) % n
+        bm.faces.new((vb[i], vb[j], vt[j], vt[i])).material_index = mat
+
+
+def gable(bm, x0, x1, ya, yb, z0, z1, mat):
+    ym = (ya + yb) / 2.0
+    v = [bm.verts.new(p) for p in ((x0, ya, z0), (x0, yb, z0), (x0, ym, z1),
+                                   (x1, ya, z0), (x1, yb, z0), (x1, ym, z1))]
+    for f in ((0, 3, 4, 1), (0, 2, 5, 3), (1, 4, 5, 2)):
+        bm.faces.new([v[i] for i in f]).material_index = mat
+    bm.faces.new((v[0], v[1], v[2])).material_index = mat
+    bm.faces.new((v[3], v[5], v[4])).material_index = mat
+
+
+def cone(bm, px, py, z0, r1, r2, depth, mat, segments=8, sx=1.0, sy=1.0):
+    res = bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=segments,
+                                radius1=r1, radius2=r2, depth=depth)
+    if sx != 1.0 or sy != 1.0:
+        bmesh.ops.scale(bm, vec=Vector((sx, sy, 1.0)), verts=res["verts"])
+    bmesh.ops.translate(bm, vec=Vector((px, py, z0 + depth / 2.0)), verts=res["verts"])
+    for f in {f for v in res["verts"] for f in v.link_faces}:
+        f.material_index = mat
+
+
+def lerp2(a, b, u):
+    return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u)
+
+
+def build_fence(bm, poly, gate_edge, gate_w, fence_h, rails, post_sep, m_curb, m_fence, m_gate):
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        L = math.hypot(b[0] - a[0], b[1] - a[1])
+        if i == gate_edge and L > gate_w + 0.8:
+            g = gate_w / L / 2.0
+            segs = [(0.0, 0.5 - g), (0.5 + g, 1.0)]
+            for u in (0.5 - g, 0.5 + g):           # postes de la puerta
+                p = lerp2(a, b, u)
+                box(bm, p[0] - 0.2, p[1] - 0.2, 0.0, p[0] + 0.2, p[1] + 0.2, fence_h + 0.5, m_gate)
+        else:
+            segs = [(0.0, 1.0)]
+        for (u0, u1) in segs:
+            pa, pb = lerp2(a, b, u0), lerp2(a, b, u1)
+            sl = math.hypot(pb[0] - pa[0], pb[1] - pa[1])
+            if sl < 0.2:
+                continue
+            beam(bm, pa, pb, -0.6, CURB_H, 0.35, m_curb)                  # bordillo
+            for r in range(rails):                                          # rieles
+                z = CURB_H + (fence_h - CURB_H) * (r + 1) / rails
+                beam(bm, pa, pb, z - 0.05, z + 0.05, 0.08, m_fence)
+            k = max(1, int(round(sl / post_sep)))
+            for j in range(k + 1):                                          # postes
+                p = lerp2(pa, pb, j / k)
+                box(bm, p[0] - 0.07, p[1] - 0.07, CURB_H, p[0] + 0.07, p[1] + 0.07, fence_h, m_fence)
+
+
+def shape(spec):
+    """(poly_local, ancho, fondo, arista_de_la_puerta)."""
+    k = GLOBAL_SCALE
+    f = spec["forma"]
+    if f == "hex":
+        R = spec["R"] * k
+        return regular_poly(R, 6), 2 * R, 2 * R * math.cos(math.pi / 6), 0
+    if f == "estanque":
+        n = spec.get("lados", 12)
+        R = spec["R"] * k
+        return regular_poly(R, n), 2 * R, 2 * R * math.cos(math.pi / n), 0
+    w, d = spec["w"] * k, spec["d"] * k
+    return [(-w / 2, -d / 2), (w / 2, -d / 2), (w / 2, d / 2), (-w / 2, d / 2)], w, d, 2
+
+
+def build_recinto(spec, S):
+    poly, w, d, gate = shape(spec)
+    rng = random.Random(spec["name"])
+    bm = bmesh.new()
+    m_floor = S.idx(spec.get("suelo", "Rec_Tierra"))
+    m_curb = S.idx("Rec_Bordillo")
+    m_fence = S.idx("Rec_Cerca")
+    m_gate = S.idx("Rec_Madera")
+    m_rock = S.idx("Rec_Roca")
+    fence_h = spec.get("altura", 2.2)
+
+    prism(bm, poly, -0.6, 0.04, m_floor)                                    # piso
+
+    water = spec.get("agua", False)
+    if water:
+        prism(bm, scale_poly(poly, 0.72), 0.0, 0.10, S.idx("Rec_Agua"))
+        R = spec["R"] * GLOBAL_SCALE
+        for i in range(int(spec.get("rocas", 6)) + 6):                      # borde de rocas
+            a = 2 * math.pi * i / (int(spec.get("rocas", 6)) + 6) + rng.uniform(-0.1, 0.1)
+            rr = R * rng.uniform(0.70, 0.78)
+            r = rng.uniform(0.35, 0.7)
+            cone(bm, math.cos(a) * rr, math.sin(a) * rr, 0.0, r, r * 0.5, r * 0.9, m_rock, 6)
+
+    build_fence(bm, poly, gate, GATE_WIDTH, fence_h, spec.get("rieles", 3),
+                spec.get("poste_sep", 2.0), m_curb, m_fence, m_gate)
+
+    if spec.get("techo", False):                                            # jaula cerrada
+        prism(bm, poly, fence_h, fence_h + 0.06, S.idx("Rec_Malla"))
+
+    avoid = []                                                              # zonas ocupadas (x0,y0,x1,y1)
+    if spec.get("refugio", False):
+        hw = min(3.2, w * 0.35) / 2.0
+        hd = 1.3
+        cy = -d / 2.0 + 0.8 + hd
+        wm, rf = S.idx("Rec_Refugio"), S.idx("Rec_Techo")
+        box(bm, -hw, cy - hd, 0.0, hw, cy + hd, 2.2, wm)
+        gable(bm, -hw - 0.3, hw + 0.3, cy - hd - 0.3, cy + hd + 0.3, 2.2, 2.2 + 1.0, rf)
+        box(bm, -0.5, cy + hd, 0.0, 0.5, cy + hd + 0.05, 1.8, m_gate)
+        avoid.append((-hw - 0.5, cy - hd - 0.5, hw + 0.5, cy + hd + 1.0))
+
+    if spec.get("bebedero", True) and not water:
+        bx = -w / 4.0
+        by = d / 2.0 - 1.8
+        box(bm, bx - 0.6, by - 0.25, 0.0, bx + 0.6, by + 0.25, 0.35, m_curb)
+        box(bm, bx - 0.5, by - 0.17, 0.30, bx + 0.5, by + 0.17, 0.34, S.idx("Rec_Agua"))
+        avoid.append((bx - 1.0, by - 0.7, bx + 1.0, by + 0.7))
+
+    inner = scale_poly(poly, 0.78)                                          # rocas decorativas
+    n_rocks = 0 if water else int(spec.get("rocas", 0))
+    tries = 0
+    while n_rocks > 0 and tries < 80:
+        tries += 1
+        x = rng.uniform(-w / 2, w / 2)
+        y = rng.uniform(-d / 2, d / 2)
+        if not point_in_poly(x, y, inner):
+            continue
+        if abs(x) < GATE_WIDTH and y > d / 2 - 3.0:                         # no tapar la puerta
+            continue
+        if any(a0 <= x <= a1 and b0 <= y <= b1 for (a0, b0, a1, b1) in avoid):
+            continue
+        r = rng.uniform(0.4, 0.9)
+        cone(bm, x, y, 0.0, r, r * 0.45, r * 0.9, m_rock, 6,
+             sx=rng.uniform(0.8, 1.3), sy=rng.uniform(0.8, 1.3))
+        n_rocks -= 1
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm, (w, d, poly, gate)
+
+
+def bm_to_object(name, bm, S, mats, col, loc, yaw, props):
+    mesh = bpy.data.meshes.new("MALLA_" + name)
+    bm.to_mesh(mesh)
+    bm.free()
+    for m in S.names:
+        mesh.materials.append(mats[m])
+    for p in mesh.polygons:
+        p.use_smooth = False
+    mesh.update()
+    obj = bpy.data.objects.new("REC_" + name, mesh)
+    obj.location = loc
+    obj.rotation_euler = (0.0, 0.0, yaw)
+    for k, v in props.items():
+        obj[k] = v
+    col.objects.link(obj)
+    return obj
+
+
+# ============================================================
+# 8. UBICACION
+# ============================================================
+def candidates(spec, roads):
+    if "ancla" in spec:
+        a = spec["ancla"]
+        info = roads.get(a["camino"])
+        if info is None:
+            warn("%s: no existe el camino '%s'." % (spec["name"], a["camino"]))
+            return
+        _poly, w, d, _g = shape(spec)
+        for dd in TRY_EXTRA_DISTANCE:
+            for ds in TRY_SHIFT_ALONG:
+                for side in (a["lado"], -a["lado"]):
+                    s = max(2.0, min(info.total - 2.0, a["t"] * info.total + ds))
+                    x, y, nx, ny = info.pose(s)
+                    off = info.hw + a["distancia"] + dd + d / 2.0
+                    bx, by = x + nx * side * off, y + ny * side * off
+                    dirx, diry = -nx * side, -ny * side            # hacia el camino
+                    desc = "lado %+d, %+d m a lo largo, +%.0f m al fondo" % (side, ds, dd)
+                    yield bx, by, math.atan2(-dirx, diry), desc
+    elif "pos" in spec:
+        yield spec["pos"][0], spec["pos"][1], math.radians(spec.get("yaw", 0.0)), "posición absoluta"
+    else:
+        warn("%s: sin 'ancla' ni 'pos'." % spec["name"])
+
+
+def check(foot, outline, surfaces, road_index, obstacles, placed):
+    cx, cy, w, d, yaw = foot
+    for (x, y) in rect_samples(cx, cy, w, d, yaw):
+        if not point_in_poly(x, y, outline) or dist_to_poly_edges((x, y), outline) < OUTLINE_MARGIN:
+            return "fuera del contorno"
+        for pl in surfaces:
+            if point_in_poly(x, y, pl) or dist_to_poly_edges((x, y), pl) < SURFACE_MARGIN:
+                return "sobre la explanada"
+        if not road_free(road_index, x, y, ROAD_CLEAR):
+            return "sobre un camino"
+        for _nm, (x0, y0, x1, y1) in obstacles:
+            if x0 - OBSTACLE_MARGIN <= x <= x1 + OBSTACLE_MARGIN and \
+                    y0 - OBSTACLE_MARGIN <= y <= y1 + OBSTACLE_MARGIN:
+                return "choca con una estructura (05)"
+    for p in placed:
+        if rects_overlap(foot, p, REC_GAP):
+            return "choca con otro recinto"
+    return None
+
+
+# ============================================================
+# 9. PROGRAMA PRINCIPAL
+# ============================================================
+def main():
+    scene = bpy.context.scene
+    col = bpy.data.collections.get(COLLECTION_NAME)
+    if col is None:
+        col = bpy.data.collections.new(COLLECTION_NAME)
+    else:
+        clear_collection(col)
+    linked = {c.name for c in scene.collection.children_recursive}
+    linked.update(c.name for c in scene.collection.children)
+    if col.name not in linked:
+        scene.collection.children.link(col)
+
+    mats = {n: simple_material(n, c, r, a) for n, (c, r, a) in MATERIALES.items()}
+    outline = get_outline()
+    ground = make_ground()
+    surfaces = collect_surface_polys()
+    road_index, roads = collect_roads()
+    obstacles = collect_obstacles()
+    placed = []
+    report = []
+
+    for spec in RECINTOS:
+        name = spec["name"]
+        _poly, w, d, _g = shape(spec)
+        chosen, last_reason = None, "sin candidatos"
+        for (cx, cy, yaw, desc) in candidates(spec, roads):
+            foot = (cx, cy, w, d, yaw)
+            reason = check(foot, outline, surfaces, road_index, obstacles, placed)
+            if reason is None:
+                chosen = (cx, cy, yaw, desc, foot)
+                break
+            last_reason = reason
+        if chosen is None:
+            report.append("OMITIDO  %-18s motivo: %s" % (name, last_reason))
+            continue
+
+        cx, cy, yaw, desc, foot = chosen
+        S = Slots()
+        bm, (w, d, _p, _gate) = build_recinto(spec, S)
+        gz = [ground(x, y) for (x, y) in rect_samples(cx, cy, w, d, yaw, step=2.5)]
+        z0 = max(gz)
+        if max(gz) - min(gz) > 0.5:
+            warn("%s: desnivel de %.2f m bajo el recinto; el bordillo baja 0.6 m para ocultarlo."
+                 % (name, max(gz) - min(gz)))
+        gx, gy = rot(0.0, d / 2.0, yaw)
+        bm_to_object(name, bm, S, mats, col, (cx, cy, z0), yaw, {
+            "tipo": spec["forma"], "preliminar": True,
+            "rotulo": spec.get("rotulo", name.replace("_", " ").title()),
+            "puerta_x": cx + gx, "puerta_y": cy + gy, "puerta_z": z0,
+            "yaw": yaw, "ancho_puerta": GATE_WIDTH, "w": w, "d": d,
+        })
+        placed.append(foot)
+        report.append("OK       %-18s (%.1f, %.1f)  %s" % (name, cx, cy, desc))
+
+    print("=" * 62)
+    print("RECINTOS: %d de %d colocados" % (sum(r.startswith("OK") for r in report), len(RECINTOS)))
+    for r in report:
+        print("  " + r)
+    print("Caminos leídos: %d | explanadas 02: %d | estructuras 05: %d"
+          % (len(roads), len(surfaces), len(obstacles)))
+    for w_ in WARNINGS:
+        print("AVISO: " + w_)
+    print("RECORDATORIO: tipos y ubicaciones son preliminares (sin Figma ni plano).")
+    print("=" * 62)
+
+
+main()

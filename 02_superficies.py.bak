@@ -1,0 +1,118 @@
+
+import bpy
+
+# ==========================================
+# ZOOLOGICO NICOLAS BRAVO
+# MODULO 02 - SUPERFICIES
+# ==========================================
+
+COLLECTION_NAME = "02_SUPERFICIES"
+
+# Altura de la base existente
+SURFACE_HEIGHT = 1.52
+
+# ------------------------------------------
+# CREAR COLECCION
+# ------------------------------------------
+
+old = bpy.data.collections.get(COLLECTION_NAME)
+
+if old:
+    for obj in list(old.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.data.collections.remove(old)
+
+collection = bpy.data.collections.new(COLLECTION_NAME)
+bpy.context.scene.collection.children.link(collection)
+
+# ------------------------------------------
+# FUNCION PARA CREAR MATERIALES
+# ------------------------------------------
+
+def create_material(name, color, roughness=0.85):
+
+    mat = bpy.data.materials.get(name)
+
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+
+    mat.diffuse_color = (*color, 1)
+
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = (*color, 1)
+        bsdf.inputs["Roughness"].default_value = roughness
+
+    return mat
+
+
+# ------------------------------------------
+# MATERIALES
+# ------------------------------------------
+
+concrete = create_material(
+    "Material_Concreto",
+    (0.48, 0.46, 0.42)
+)
+
+soil = create_material(
+    "Material_Tierra",
+    (0.27, 0.17, 0.09)
+)
+
+grass = create_material(
+    "Material_Pasto",
+    (0.13, 0.29, 0.08)
+)
+
+
+# ------------------------------------------
+# FUNCION PARA CREAR SUPERFICIES
+# ------------------------------------------
+
+def create_surface(name, points, material):
+
+    vertices = [
+        (x, y, SURFACE_HEIGHT)
+        for x, y in points
+    ]
+
+    faces = [tuple(range(len(vertices)))]
+
+    mesh = bpy.data.meshes.new(name + "_Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.materials.append(material)
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+
+    solidify = obj.modifiers.new(
+        "Grosor_Superficie", "SOLIDIFY"
+    )
+    solidify.thickness = 0.025
+
+    return obj
+
+
+# ------------------------------------------
+# EXPLANADA PRINCIPAL
+# ------------------------------------------
+
+plaza = [
+    (-68, -39),
+    (-9, -39),
+    (-9, -8),
+    (-63, -2)
+]
+
+create_surface(
+    "SUPERFICIE_EXPLANADA_PRINCIPAL",
+    plaza,
+    concrete
+)
+
+
+print("MODULO 02 - SUPERFICIES CREADO")

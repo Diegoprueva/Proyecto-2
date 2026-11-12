@@ -1,0 +1,154 @@
+# ============================================================
+# 3. TRAZADOS DESDE FIGMA (líneas moradas)
+#    REEMPLAZA el bloque antiguo "PATHS = [ ... ]".
+# ============================================================
+import re
+
+# --- 3.1 Calibración: esquinas de la plaza -------------------------------
+# En Figma, pon un punto pequeño sobre cada esquina de la plaza y anota su X, Y
+# (panel derecho; mismo frame que los trazos morados).
+# El número es el índice de esa esquina en obj["explanada"] de 01:
+#   0 = (-64.0, -39.5)   1 = (-4.5, -44.5)   2 = (-6.0, -16.5)   3 = (-73.5, -14.0)
+# Correspondencia que DEDUZCO (la foto está girada ~180° respecto a 01):
+#   arriba-izq en la foto -> 1 | arriba-der -> 0 | abajo-der -> 3 | abajo-izq -> 2
+# El script imprime el error de ajuste; si sale grande, esta correspondencia está mal.
+CALIBRACION = [
+    ((None, None), 1),   # esquina arriba-izquierda de la plaza en la foto
+    ((None, None), 0),   # arriba-derecha
+    ((None, None), 3),   # abajo-derecha
+    ((None, None), 2),   # abajo-izquierda
+]
+
+# --- 3.2 Trazos ----------------------------------------------------------
+# Un dict por camino:
+#   name      : nombre único (sin espacios)
+#   tipo      : "principal" | "secundario" | "sendero"  (ancho según TIPOS, o pon "ancho")
+#   svg       : lo que va dentro de d="..." al copiar el trazo como SVG (solo M L H V C Z absolutos)
+#   puntos_px : alternativa al svg: [(x, y), ...] en coordenadas de Figma
+#   origen    : (X, Y) del trazo en Figma (panel derecho); se suma a las coords del SVG
+#   conecta / dz / ancho : opcionales, igual que antes (los padres van primero)
+TRAZOS = [
+    # dict(name="CAMINO_1", tipo="secundario", origen=(0, 0), svg="M0 0L10 5C..."),
+]
+TOLERANCIA_SIMPLIFICAR = 0.8   # m; sube = menos puntos de control, baja = sigue más la línea
+
+
+def _svg_a_puntos(d, pasos=8):
+    """Trazo SVG (M/L/H/V/C/Z absolutos) -> lista de puntos (x, y)."""
+    if re.search(r"[^MLHVCZ0-9eE.,\s+-]", d):
+        raise RuntimeError("El SVG usa comandos no soportados (solo M L H V C Z absolutos).")
+    tok = re.findall(r"[MLHVCZ]|-?\d*\.?\d+(?:[eE][-+]?\d+)?", d)
+    pts, cur, i, cmd = [], (0.0, 0.0), 0, None
+
+    def num():
+        nonlocal i
+        v = float(tok[i])
+        i += 1
+        return v
+
+    while i < len(tok):
+        if tok[i].isalpha():
+            cmd = tok[i]
+            i += 1
+            if cmd == "Z":
+                continue
+        if cmd in ("M", "L"):
+            cur = (num(), num())
+            pts.append(cur)
+        elif cmd == "H":
+            cur = (num(), cur[1])
+            pts.append(cur)
+        elif cmd == "V":
+            cur = (cur[0], num())
+            pts.append(cur)
+        elif cmd == "C":
+            c1, c2, p = (num(), num()), (num(), num()), (num(), num())
+            for k in range(1, pasos + 1):
+                t = k / pasos
+                u = 1 - t
+                pts.append((u**3 * cur[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t**3 * p[0],
+                            u**3 * cur[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t**3 * p[1]))
+            cur = p
+        else:
+            raise RuntimeError("Comando SVG inesperado cerca del dato %d." % i)
+    return pts
+
+
+def _dist_seg(p, a, b):
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    l2 = abx * abx + aby * aby
+    u = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / l2))
+    return math.hypot(p[0] - (a[0] + abx * u), p[1] - (a[1] + aby * u))
+
+
+def _simplificar(pts, tol):
+    """Douglas-Peucker (iterativo): menos puntos, misma forma."""
+    if len(pts) < 3:
+        return list(pts)
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    pila = [(0, len(pts) - 1)]
+    while pila:
+        a, b = pila.pop()
+        dmax, k = 0.0, None
+        for j in range(a + 1, b):
+            d = _dist_seg(pts[j], pts[a], pts[b])
+            if d > dmax:
+                dmax, k = d, j
+        if k is not None and dmax > tol:
+            keep[k] = True
+            pila.extend([(a, k), (k, b)])
+    return [p for p, kp in zip(pts, keep) if kp]
+
+
+def _construir_paths():
+    if not TRAZOS:
+        raise RuntimeError("TRAZOS está vacío: pega los trazos morados de Figma (sección 3.2).")
+    base = bpy.data.objects.get(BASE_OBJECT_NAME)
+    if base is None or "explanada" not in base.keys():
+        raise RuntimeError("Falta el objeto base de 01 (o su propiedad 'explanada'). Corre 01 primero.")
+    ex = list(base["explanada"])
+    esq = [(ex[i], ex[i + 1]) for i in range(0, len(ex), 2)]
+
+    # Ajuste de similitud (escala + giro + traslación) por mínimos cuadrados.
+    # El eje Y de Figma va hacia abajo, por eso se invierte.
+    a, b = [], []
+    for (px, py), idx in CALIBRACION:
+        if px is None or py is None:
+            raise RuntimeError("Faltan coordenadas en CALIBRACION (esquinas de la plaza en Figma).")
+        a.append(complex(px, -py))
+        b.append(complex(esq[idx][0], esq[idx][1]))
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    den = sum(abs(x - ma) ** 2 for x in a)
+    if den < 1e-9:
+        raise RuntimeError("Las esquinas de CALIBRACION coinciden entre sí.")
+    z = sum((x - ma).conjugate() * (y - mb) for x, y in zip(a, b)) / den
+    t = mb - z * ma
+    err = max(abs(z * x + t - y) for x, y in zip(a, b))
+    print("CALIBRACION: %.3f m/px | giro %.0f° | error máx %.1f m  (01 usó 0.14 m/px y ~158°)"
+          % (abs(z), math.degrees(math.atan2(z.imag, z.real)), err))
+
+    paths = []
+    for tr in TRAZOS:
+        if tr.get("tipo") not in TIPOS:
+            raise RuntimeError("El trazo '%s' tiene un tipo inválido." % tr.get("name", "?"))
+        pts = _svg_a_puntos(tr["svg"]) if tr.get("svg") else [tuple(p) for p in tr.get("puntos_px", [])]
+        ox, oy = tr.get("origen", (0.0, 0.0))
+        met = []
+        for x, y in pts:
+            w = z * complex(x + ox, -(y + oy)) + t
+            met.append((w.real, w.imag))
+        met = _simplificar(met, TOLERANCIA_SIMPLIFICAR)
+        if len(met) < 2:
+            raise RuntimeError("El trazo '%s' quedó con menos de 2 puntos." % tr["name"])
+        d = dict(name=tr["name"], tipo=tr["tipo"], puntos=[(round(x, 2), round(y, 2)) for x, y in met])
+        for k in ("ancho", "conecta", "dz"):
+            if k in tr:
+                d[k] = tr[k]
+        paths.append(d)
+        print("  %s: %d puntos de control" % (tr["name"], len(met)))
+    return paths
+
+
+PATHS = _construir_paths()

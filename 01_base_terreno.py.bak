@@ -1,0 +1,279 @@
+# -*- coding: utf-8 -*-
+"""
+============================================================
+ZOOLOGICO NICOLAS BRAVO - MODULO 01 - BASE DEL TERRENO
+============================================================
+Terreno base como malla 3D (losa con espesor), con pasto procedural arriba
+y tierra en los costados y la cara inferior.
+
+CONTORNO
+  El contorno ya NO es una estimación a ojo: sale de los vectores trazados
+  sobre la foto aérea del Figma ("Zoo Portal - App Mockups", Page 1).
+  Los puntos de la foto (px) se pasaron a metros con:
+      escala  = 0.14 m/px
+      giro    = 158 grados (la foto aérea está girada ~180 grados respecto
+                a la vista norte-arriba de Google Maps)
+  y se anclaron para coincidir con el contorno anterior (~78 % de traslape).
+  Se simplificó de 49 a 32 vértices (tolerancia 1 m).
+  Sistema de coordenadas: X/Y en metros, Z hacia arriba, norte = +Y.
+
+EXPLANADA
+  La explanada (plaza de piedra) queda como un HUECO abierto por el lado
+  oeste (entre los puntos (-72,-48.5) y (-76,2.5)). El módulo 02 debe
+  rellenarlo. Sus 4 esquinas están en EXPLANADA y se guardan también en la
+  propiedad personalizada obj["explanada"] (x1,y1,x2,y2,...), para que 02
+  las lea en vez de usar números fijos.
+
+CONTRATO CON LOS DEMAS MODULOS (no cambiar)
+  - Objeto "BASE_ZOOLOGICO_NICOLAS_BRAVO" en la colección "01_BASE_TERRENO".
+  - Malla con 2*n vértices: anillo inferior (z = 0) = vértices 0..n-1,
+    anillo superior (z = THICKNESS) = vértices n..2n-1, en el orden de
+    OUTLINE. 03, 05, 06 y 07 leen el anillo superior como contorno.
+  - Cara superior plana a z = THICKNESS (1.5 m).
+
+IMPORTANTE
+  Al cambiar este contorno, los trazados de 03 (caminos, coordenadas
+  absolutas) y el rectángulo de la explanada de 02 ya no coinciden: corre
+  02 y 03 de nuevo y revisa sus avisos. Usa solo la API de datos
+  (sin bpy.ops). Pensado para Blender 3.x/4.x.
+
+ORDEN: 01 -> 02 -> 03 -> 05 -> 06 -> 07 -> 04. Es seguro repetir este
+script: solo reconstruye 01_BASE_TERRENO.
+============================================================
+"""
+
+import bpy
+import math
+
+# ============================================================
+# 1. CONFIGURACION
+# ============================================================
+COLLECTION_NAME = "01_BASE_TERRENO"
+OBJECT_NAME = "BASE_ZOOLOGICO_NICOLAS_BRAVO"
+MESH_NAME = "Malla_Base_Zoologico"
+THICKNESS = 1.5            # espesor de la losa (m); 03/05/06/07 asumen 1.5 como respaldo
+
+# Contorno (X, Y) en metros. Sentido horario visto desde arriba.
+OUTLINE = [
+    (89.0, 13.5), (79.0, -19.0), (67.5, -17.0), (63.0, -18.0), (58.5, -24.5),
+    (48.0, -31.5), (42.5, -44.0), (30.0, -47.0), (8.5, -55.5), (7.5, -64.5),
+    (11.5, -92.5), (-11.5, -89.5), (-18.0, -90.5), (-36.5, -89.0), (-68.0, -85.0),
+    (-69.0, -63.5), (-72.0, -48.5),
+    # --- hueco de la explanada (abierto hacia el oeste) ---
+    (-64.0, -39.5), (-4.5, -44.5), (-6.0, -16.5), (-73.5, -14.0),
+    # -------------------------------------------------------
+    (-76.0, 2.5), (-67.5, 24.5), (-54.0, 49.5), (-42.5, 82.0), (-40.0, 84.0),
+    (-18.5, 79.5), (19.5, 65.5), (20.5, 64.5), (10.5, 40.5), (21.0, 36.0),
+    (57.5, 26.0),
+]
+
+# Esquinas de la explanada (las mismas que el hueco de OUTLINE).
+EXPLANADA = [(-64.0, -39.5), (-4.5, -44.5), (-6.0, -16.5), (-73.5, -14.0)]
+
+# Materiales: color, variación de tono, escala de manchas (1/m), de grano, rugosidad, relieve
+PASTO = dict(nombre="Material_Base_Terreno", color=(0.20, 0.38, 0.16), variacion=0.22,
+             manchas=0.06, grano=7.0, rugosidad=0.95, bump=0.30)
+TIERRA = dict(nombre="Material_Base_Terreno_Lado", color=(0.27, 0.18, 0.10), variacion=0.18,
+              manchas=0.15, grano=9.0, rugosidad=0.95, bump=0.35)
+
+BEVEL_WIDTH = 0.15
+BEVEL_SEGMENTS = 3
+
+
+# ============================================================
+# 2. VALIDACION DEL CONTORNO
+# ============================================================
+def signed_area(poly):
+    s = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        s += x1 * y2 - x2 * y1
+    return s / 2.0
+
+
+def segments_cross(p1, p2, p3, p4):
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    return ((cross(p3, p4, p1) > 0) != (cross(p3, p4, p2) > 0)) and \
+           ((cross(p1, p2, p3) > 0) != (cross(p1, p2, p4) > 0))
+
+
+def validate_outline(poly):
+    """Devuelve la lista de problemas; vacía si el contorno es válido."""
+    problems = []
+    n = len(poly)
+    if n < 3:
+        return ["El contorno necesita al menos 3 puntos."]
+    for i in range(n):
+        j = (i + 1) % n
+        if math.hypot(poly[j][0] - poly[i][0], poly[j][1] - poly[i][1]) < 0.05:
+            problems.append("Puntos repetidos en la posición %d." % i)
+    for i in range(n):
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            if segments_cross(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n]):
+                problems.append("El contorno se cruza a sí mismo (aristas %d y %d)." % (i, j))
+    if abs(signed_area(poly)) < 1.0:
+        problems.append("El área del contorno es casi cero.")
+    return problems
+
+
+# ============================================================
+# 3. MATERIALES (procedurales, sin imágenes)
+# ============================================================
+def build_material(cfg):
+    mat = bpy.data.materials.get(cfg["nombre"]) or bpy.data.materials.new(cfg["nombre"])
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    L = nt.links
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (700, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (420, 0)
+    bsdf.inputs["Roughness"].default_value = cfg["rugosidad"]
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    tc.location = (-900, 0)
+    big = nt.nodes.new("ShaderNodeTexNoise")
+    big.location = (-650, 150)
+    big.inputs["Scale"].default_value = cfg["manchas"]
+    big.inputs["Detail"].default_value = 5.0
+    fine = nt.nodes.new("ShaderNodeTexNoise")
+    fine.location = (-650, -150)
+    fine.inputs["Scale"].default_value = cfg["grano"]
+    fine.inputs["Detail"].default_value = 8.0
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-380, 150)
+    v, c = cfg["variacion"], cfg["color"]
+    ramp.color_ramp.elements[0].position = 0.35
+    ramp.color_ramp.elements[0].color = tuple(max(0.0, k * (1 - v)) for k in c) + (1.0,)
+    ramp.color_ramp.elements[1].position = 0.65
+    ramp.color_ramp.elements[1].color = tuple(min(1.0, k * (1 + v)) for k in c) + (1.0,)
+    bump = nt.nodes.new("ShaderNodeBump")
+    bump.location = (180, -200)
+    bump.inputs["Strength"].default_value = cfg["bump"]
+    bump.inputs["Distance"].default_value = 0.05
+    L.new(tc.outputs["Object"], big.inputs["Vector"])
+    L.new(tc.outputs["Object"], fine.inputs["Vector"])
+    L.new(big.outputs["Fac"], ramp.inputs["Fac"])
+    L.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+    L.new(fine.outputs["Fac"], bump.inputs["Height"])
+    L.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+    L.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    mat.diffuse_color = tuple(c) + (1.0,)      # color en vista sólida
+    return mat
+
+
+# ============================================================
+# 4. COLECCION (limpieza segura: solo esta colección)
+# ============================================================
+def clear_collection(col):
+    metas = set()
+    for o in list(col.objects):
+        if o.data is not None:
+            metas.add(o.data)
+        bpy.data.objects.remove(o, do_unlink=True)
+    for d in metas:
+        if d.users == 0 and isinstance(d, bpy.types.Mesh):
+            bpy.data.meshes.remove(d)
+
+
+def ensure_linked(scene, col):
+    """Enlaza la colección a la escena solo si no está ya enlazada en algún nivel."""
+    linked = {c.name for c in scene.collection.children_recursive}
+    linked.update(c.name for c in scene.collection.children)
+    if col.name not in linked:
+        scene.collection.children.link(col)
+
+
+# ============================================================
+# 5. PROGRAMA PRINCIPAL
+# ============================================================
+def main():
+    problems = validate_outline(OUTLINE)
+    if problems:
+        raise RuntimeError("Contorno inválido: " + " | ".join(problems))
+
+    scene = bpy.context.scene
+    col = bpy.data.collections.get(COLLECTION_NAME)
+    if col is None:
+        col = bpy.data.collections.new(COLLECTION_NAME)
+    else:
+        clear_collection(col)
+    ensure_linked(scene, col)
+
+    stale = bpy.data.meshes.get(MESH_NAME)
+    if stale is not None and stale.users == 0:
+        bpy.data.meshes.remove(stale)
+
+    grass, soil = build_material(PASTO), build_material(TIERRA)
+
+    # --- Malla: anillo inferior (0..n-1) y superior (n..2n-1), mismo orden que OUTLINE ---
+    n = len(OUTLINE)
+    ccw = signed_area(OUTLINE) > 0          # las caras deben mirar hacia afuera
+    verts = [(x, y, 0.0) for x, y in OUTLINE] + [(x, y, THICKNESS) for x, y in OUTLINE]
+    top = tuple(range(n, 2 * n))
+    bottom = tuple(reversed(range(n)))
+    if not ccw:
+        top, bottom = tuple(reversed(top)), tuple(reversed(bottom))
+    faces = [bottom, top]
+    for i in range(n):
+        j = (i + 1) % n
+        side = (i, j, j + n, i + n)
+        faces.append(side if ccw else tuple(reversed(side)))
+
+    mesh = bpy.data.meshes.new(MESH_NAME)
+    mesh.from_pydata(verts, [], faces)
+    mesh.materials.append(grass)       # índice 0: cara superior
+    mesh.materials.append(soil)        # índice 1: costados y base
+    mesh.update()
+    for k, poly in enumerate(mesh.polygons):
+        poly.material_index = 0 if k == 1 else 1
+        poly.use_smooth = False
+    if hasattr(mesh, "use_auto_smooth"):    # Blender 3.x / 4.0
+        try:
+            mesh.use_auto_smooth = True
+        except Exception:
+            pass
+
+    terrain = bpy.data.objects.new(OBJECT_NAME, mesh)
+    col.objects.link(terrain)
+    terrain.color = PASTO["color"] + (1.0,)
+    terrain["espesor"] = THICKNESS
+    terrain["explanada"] = [c for p in EXPLANADA for c in p]
+    terrain["fuente"] = "trazo Figma (foto aerea), 0.14 m/px, giro 158 grados"
+
+    bevel = terrain.modifiers.new("Bordes_Suaves", "BEVEL")
+    bevel.width = BEVEL_WIDTH
+    bevel.segments = BEVEL_SEGMENTS
+    bevel.limit_method = 'ANGLE'
+    terrain.modifiers.new("Normales", "WEIGHTED_NORMAL")
+
+    # Selección sin bpy.ops
+    try:
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        terrain.select_set(True)
+        bpy.context.view_layer.objects.active = terrain
+    except Exception:
+        pass
+
+    xs = [p[0] for p in OUTLINE]
+    ys = [p[1] for p in OUTLINE]
+    perim = sum(math.hypot(OUTLINE[(i + 1) % n][0] - OUTLINE[i][0],
+                           OUTLINE[(i + 1) % n][1] - OUTLINE[i][1]) for i in range(n))
+    ex = [p[0] for p in EXPLANADA]
+    ey = [p[1] for p in EXPLANADA]
+    print("=" * 60)
+    print("BASE DEL ZOOLOGICO CREADA: %d vértices por anillo" % n)
+    print("Área aprox. %.0f m2 (sin la explanada) | perímetro %.0f m" % (abs(signed_area(OUTLINE)), perim))
+    print("Extensión X %.0f..%.0f | Y %.0f..%.0f" % (min(xs), max(xs), min(ys), max(ys)))
+    print("Explanada (hueco): X %.0f..%.0f | Y %.0f..%.0f  (guardada en obj['explanada'])"
+          % (min(ex), max(ex), min(ey), max(ey)))
+    print("RECORDATORIO: vuelve a correr 02 y 03 (y 05, 06, 07) con este contorno.")
+    print("=" * 60)
+
+
+main()

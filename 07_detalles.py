@@ -4,10 +4,12 @@
 ZOOLOGICO NICOLAS BRAVO - MODULO 07 - DETALLES
 ============================================================
 Mobiliario y señalización, como mallas 3D procedurales:
-  - Bancas, lámparas y botes de basura repartidos a lo largo de los caminos
+  - Bancas y botes de basura repartidos a lo largo de los caminos
     de 03, según el TIPO de camino (principal / secundario / sendero).
   - Letreros con el nombre de cada recinto de 06, junto a su puerta.
+  - Placas de fachada para identificar taquillas y servicios de 05.
   - Señales manuales (mapa de entrada, información, etc.) ancladas a un camino.
+  - No se generan lámparas junto a los caminos, para mantenerlos despejados.
 
 COMO SE UBICAN
   Todo se reparte por distancia a lo largo de cada CAMINO_xxx de 03 y se
@@ -41,6 +43,7 @@ BASE_OBJECT_NAME = "BASE_ZOOLOGICO_NICOLAS_BRAVO"
 TERRAIN_COLLECTIONS = ["01_BASE_TERRENO", "02_SUPERFICIES"]
 ROADS_COLLECTION = "03_CAMINOS"
 RECINTOS_COLLECTION = "06_RECINTOS"
+STRUCTURES_COLLECTION = "05_ESTRUCTURAS"
 OBSTACLE_PREFIXES = ("05_", "06_", "08_")
 
 FALLBACK_OUTLINE = [
@@ -60,19 +63,17 @@ SHOW_SIGN_TEXT = True     # texto 3D en los letreros
 
 # Cada cuántos metros va cada pieza, por tipo de camino (0 = ninguna)
 REGLAS = {
-    "principal":  dict(bancas=20.0, lamparas=16.0, botes=40.0),
-    "secundario": dict(bancas=28.0, lamparas=22.0, botes=56.0),
-    "sendero":    dict(bancas=35.0, lamparas=0.0,  botes=0.0),
+    "principal":  dict(bancas=20.0, botes=40.0),
+    "secundario": dict(bancas=28.0, botes=56.0),
+    "sendero":    dict(bancas=35.0, botes=0.0),
 }
-# Ajustes por camino concreto (sobrescriben a REGLAS). Ejemplo:
-# "ACCESO_EXPLANADA_NORTE": dict(lamparas=10.0)
+# Ajustes por camino concreto (sobrescriben a REGLAS).
 OVERRIDES = {}
 EXCLUIR_CAMINOS = ()      # nombres de caminos sin mobiliario
 
 OFFSET_BANCA = 0.95       # distancia del borde del camino al centro de la pieza
-OFFSET_LAMPARA = 0.70
 OFFSET_BOTE = 0.80
-MIN_SEP = dict(banca=6.0, lampara=6.0, bote=6.0, senal=3.0)
+MIN_SEP = dict(banca=6.0, bote=6.0, senal=3.0)
 
 # Señales manuales ancladas a un camino: t = fracción del recorrido (0..1).
 SENALES = [
@@ -93,7 +94,6 @@ MATERIALES = {
     "Det_Madera":  ((0.30, 0.17, 0.08), 0.80, 0.0),
     "Det_Concreto": ((0.60, 0.58, 0.54), 0.90, 0.0),
     "Det_Metal":   ((0.10, 0.11, 0.12), 0.45, 0.0),
-    "Det_Luz":     ((1.00, 0.90, 0.60), 0.30, 3.0),
     "Det_Bote":    ((0.12, 0.35, 0.18), 0.60, 0.0),
     "Det_Panel":   ((0.08, 0.30, 0.18), 0.70, 0.0),
     "Det_Texto":   ((0.95, 0.95, 0.92), 0.60, 0.0),
@@ -281,6 +281,30 @@ def collect_gates():
     return out
 
 
+def collect_services():
+    """Lee los servicios de 05 y sus dimensiones de fachada."""
+    out = []
+    col = bpy.data.collections.get(STRUCTURES_COLLECTION)
+    if col is None:
+        return out
+    for obj in col.objects:
+        label = obj.get("servicio")
+        if obj.type != "MESH" or not label:
+            continue
+        out.append({
+            "name": obj.name,
+            "label": str(label),
+            "x": obj.location.x,
+            "y": obj.location.y,
+            "z": obj.location.z,
+            "yaw": obj.rotation_euler.z,
+            "w": float(obj.get("servicio_ancho", 0.0)),
+            "d": float(obj.get("servicio_fondo", 0.0)),
+            "h": float(obj.get("servicio_altura", 0.0)),
+        })
+    return out
+
+
 def simple_material(name, color, rough, emit):
     mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     mat.use_nodes = True
@@ -355,17 +379,6 @@ def build_banca(S):
     return bm
 
 
-def build_lampara(S):
-    bm = bmesh.new()
-    metal, luz, conc = S.idx("Det_Metal"), S.idx("Det_Luz"), S.idx("Det_Concreto")
-    cone(bm, 0, 0, -0.2, 0.28, 0.22, 0.5, conc, 8)                  # base
-    cone(bm, 0, 0, 0.3, 0.07, 0.05, 3.7, metal, 8)                  # poste
-    box(bm, -0.05, 0.0, 3.85, 0.05, 0.7, 3.93, metal)               # brazo hacia el camino (+Y)
-    box(bm, -0.2, 0.5, 3.70, 0.2, 0.9, 3.85, luz)                   # luminaria
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    return bm
-
-
 def build_bote(S):
     bm = bmesh.new()
     body, metal = S.idx("Det_Bote"), S.idx("Det_Metal")
@@ -382,6 +395,18 @@ def build_senal(S, w, h):
     for sx in (-1, 1):
         box(bm, sx * (w / 2 - 0.1) - 0.04, -0.04, -0.2, sx * (w / 2 - 0.1) + 0.04, 0.04, top, metal)
     box(bm, -w / 2, -0.03, 0.9, w / 2, 0.03, 0.9 + h, panel)        # panel (frente +Y)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    return bm
+
+
+def build_service_plaque(S, w, h):
+    bm = bmesh.new()
+    metal, panel = S.idx("Det_Metal"), S.idx("Det_Panel")
+    box(bm, -w / 2.0, -0.025, -h / 2.0,
+        w / 2.0, 0.055, h / 2.0, panel)
+    for x in (-w * 0.32, w * 0.32):
+        box(bm, x - 0.035, -0.075, -h * 0.38,
+            x + 0.035, -0.02, h * 0.38, metal)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     return bm
 
@@ -500,10 +525,11 @@ def main():
     road_index, roads = collect_roads()
     obstacles = collect_obstacles()
     gates = collect_gates()
+    services = collect_services()
     placer = Placer(outline, road_index, obstacles, ground, col, mats)
     report = []
 
-    # --- Bancas, lámparas y botes a lo largo de los caminos ---
+    # --- Bancas y botes a lo largo de los caminos; se omiten lámparas ---
     for rname, road in roads.items():
         if rname in EXCLUIR_CAMINOS:
             continue
@@ -511,11 +537,9 @@ def main():
         rules.update(OVERRIDES.get(rname, {}))
         nb = scatter_along(road, "banca", build_banca, "BANCA", rules.get("bancas", 0),
                            OFFSET_BANCA, placer, start_shift=3.0)
-        nl = scatter_along(road, "lampara", build_lampara, "LAMPARA", rules.get("lamparas", 0),
-                           OFFSET_LAMPARA, placer, start_shift=0.0)
         nt = scatter_along(road, "bote", build_bote, "BOTE", rules.get("botes", 0),
                            OFFSET_BOTE, placer, start_shift=6.0)
-        report.append("%-24s %-10s bancas %2d | lámparas %2d | botes %2d" % (rname, road.tipo, nb, nl, nt))
+        report.append("%-24s %-10s bancas %2d | botes %2d" % (rname, road.tipo, nb, nt))
 
     # --- Letreros de recintos (junto a la puerta) ---
     ns = 0
@@ -540,6 +564,32 @@ def main():
         if not placed_ok:
             warn("Letrero de %s omitido: no hay sitio libre junto a la puerta." % g["name"])
     report.append("Letreros de recintos: %d de %d" % (ns, len(gates)))
+
+    # --- Placas montadas sobre las fachadas de servicios ---
+    service_signs = 0
+    for service in services:
+        if service["w"] <= 0.0 or service["d"] <= 0.0 or service["h"] <= 0.0:
+            warn("Placa de %s omitida: faltan dimensiones de fachada." % service["name"])
+            continue
+        sign_w = min(4.8, max(1.6, service["w"] * 0.48))
+        sign_h = 0.52
+        sign_z = min(service["h"] - 0.34, 2.42)
+        if sign_z <= sign_h / 2.0:
+            warn("Placa de %s omitida: fachada demasiado baja." % service["name"])
+            continue
+        dx, dy = rot(0.0, service["d"] / 2.0 + 0.015, service["yaw"])
+        x, y = service["x"] + dx, service["y"] + dy
+        name = "SERVICIO_" + service["name"].removeprefix("EST_")
+        slots = Slots()
+        plaque = build_service_plaque(slots, sign_w, sign_h)
+        bm_to_object(name, plaque, slots, mats, col,
+                     (x, y, service["z"] + sign_z), service["yaw"],
+                     {"tipo": "placa_servicio", "servicio": service["label"]})
+        if SHOW_SIGN_TEXT:
+            add_text(name, service["label"], x, y, service["z"] + sign_z,
+                     service["yaw"], sign_w, sign_h, mats["Det_Texto"], col)
+        service_signs += 1
+    report.append("Placas de servicios: %d de %d" % (service_signs, len(services)))
 
     # --- Señales manuales ---
     nm_ok = 0
@@ -572,8 +622,9 @@ def main():
     report.append("Señales manuales: %d de %d" % (nm_ok, len(SENALES)))
 
     print("=" * 62)
-    print("DETALLES: bancas %d | lámparas %d | botes %d | señales/letreros %d"
-          % (placer.count["banca"], placer.count["lampara"], placer.count["bote"], placer.count["senal"]))
+    print("DETALLES: bancas %d | lámparas 0 | botes %d | señales/letreros %d | servicios %d"
+          % (placer.count["banca"], placer.count["bote"], placer.count["senal"],
+             service_signs))
     for r in report:
         print("  " + r)
     print("Caminos leídos: %d | recintos con puerta: %d | obstáculos 05/06/08: %d"

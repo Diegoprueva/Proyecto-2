@@ -110,25 +110,31 @@ ESTRUCTURAS = [
          cruza=dict(camino="AV_PRINCIPAL", t=0.05)),     # acceso por CONFIRMAR
 
     dict(name="TAQUILLA_A", tipo="casa", w=2.6, d=2.6, h=2.8, techo="plano",
+         servicio="TAQUILLA",
          muro="Estr_Muro_Blanco", ventanas=1,
          ancla=dict(camino="AV_PRINCIPAL", t=0.05, lado=+1, distancia=1.5)),
     dict(name="TAQUILLA_B", tipo="casa", w=2.6, d=2.6, h=2.8, techo="plano",
+         servicio="TAQUILLA",
          muro="Estr_Muro_Blanco", ventanas=1,
          ancla=dict(camino="AV_PRINCIPAL", t=0.05, lado=-1, distancia=1.5)),
 
     dict(name="TIENDA", tipo="casa", w=7.0, d=5.0, h=3.0, techo="dos_aguas",
+         servicio="TIENDA",
          muro="Estr_Muro_Ocre", cubierta="Estr_Techo_Teja", ventanas=2,
          ancla=dict(camino="AV_PRINCIPAL", t=0.09, lado=-1, distancia=4.0)),
 
     dict(name="ADMINISTRACION", tipo="casa", w=12.0, d=7.0, h=3.4, techo="dos_aguas",
+         servicio="ADMINISTRACION",
          muro="Estr_Muro_Crema", cubierta="Estr_Techo_Teja", ventanas=3,
          ancla=dict(camino="AV_PRINCIPAL", t=0.20, lado=+1, distancia=6.0)),
 
     dict(name="SANITARIOS_NORTE", tipo="casa", w=8.0, d=4.0, h=3.0, techo="plano",
+         servicio="SANITARIOS",
          muro="Estr_Muro_Blanco", ventanas=2,
          ancla=dict(camino="ANILLO_NOROESTE", t=0.45, lado=+1, distancia=4.0)),
 
     dict(name="CAFETERIA", tipo="casa", w=10.0, d=8.0, h=3.5, techo="cuatro_aguas",
+         servicio="CAFETERIA",
          muro="Estr_Muro_Crema", cubierta="Estr_Techo_Teja", ventanas=3,
          ancla=dict(camino="AV_PRINCIPAL", t=0.60, lado=+1, distancia=8.0)),
 
@@ -144,10 +150,12 @@ ESTRUCTURAS = [
          cubierta="Estr_Techo_Lamina", en_explanada=True, explanada=(0.0, 0.0)),
 
     dict(name="VETERINARIA", tipo="casa", w=10.0, d=6.0, h=3.2, techo="plano",
+         servicio="VETERINARIA",
          muro="Estr_Muro_Blanco", ventanas=3,
          ancla=dict(camino="RAMAL_SUROESTE", t=0.85, lado=-1, distancia=4.0)),
 
     dict(name="SANITARIOS_SUR", tipo="casa", w=7.0, d=4.0, h=3.0, techo="plano",
+         servicio="SANITARIOS",
          muro="Estr_Muro_Blanco", ventanas=2,
          ancla=dict(camino="SENDERO_SUR", t=0.50, lado=+1, distancia=3.0)),
 ]
@@ -683,8 +691,30 @@ def update_existing_geometry(col, mats):
             continue
 
         replace_object_geometry(obj, bm, slots, mats)
+        obj["tipo"] = spec["tipo"]
+        obj["preliminar"] = True
+        if spec.get("servicio"):
+            service_metadata = structure_service_metadata(spec)
+            for key, value in service_metadata.items():
+                obj[key] = value
+        elif "servicio" in obj:
+            del obj["servicio"]
+            for key in ("servicio_ancho", "servicio_fondo", "servicio_altura"):
+                if key in obj:
+                    del obj[key]
         updated += 1
     return updated
+
+
+def structure_service_metadata(spec):
+    """Guarda la fachada y dimensiones para que 07 coloque placas en servicios."""
+    scale = GLOBAL_SCALE
+    return {
+        "servicio": spec["servicio"],
+        "servicio_ancho": float(spec["w"]) * scale,
+        "servicio_fondo": float(spec["d"]) * scale,
+        "servicio_altura": float(spec["h"]) * scale,
+    }
 
 
 # ============================================================
@@ -850,8 +880,10 @@ def main():
         z0 = max(gz)
         if max(gz) - min(gz) > 0.35:
             warn("%s: desnivel de %.2f m bajo la huella; revisa el zócalo." % (name, max(gz) - min(gz)))
-        bm_to_object(name, bm, S, mats, col, (cx, cy, z0), yaw,
-                     {"tipo": spec["tipo"], "preliminar": True})
+        properties = {"tipo": spec["tipo"], "preliminar": True}
+        if spec.get("servicio"):
+            properties.update(structure_service_metadata(spec))
+        bm_to_object(name, bm, S, mats, col, (cx, cy, z0), yaw, properties)
         placed.extend(foots)
         report.append("OK       %-20s (%.1f, %.1f)  %s" % (name, cx, cy, desc))
 

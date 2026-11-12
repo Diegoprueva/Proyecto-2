@@ -8,6 +8,7 @@ Habitats y cercados 3D procedurales:
                   vista satelital) con piso, bordillo, cerca, refugio y rocas.
   - "rect"      : recinto rectangular (cerca baja o jaula alta con techo o domo).
   - "estanque"  : estanque poligonal con agua, borde de rocas y cerca baja.
+  - vegetación baja y troncos decorativos dentro de los recintos secos.
   - zonas moradas: recintos rústicos con bloque, lámina ondulada, techo
                    inclinado y cama de paja.
   - 10 recintos rústicos adicionales: se buscan junto a caminos libres.
@@ -93,6 +94,9 @@ MATERIALES = {
     "Rec_Purpura":  ((0.22, 0.25, 0.18), 0.72, 1.0),
     "Rec_Malla_Domo": ((0.12, 0.15, 0.13), 0.72, 0.55),
     "Rec_Madera":   ((0.25, 0.14, 0.07), 0.80, 1.0),
+    "Rec_Tronco":   ((0.20, 0.11, 0.055), 0.95, 1.0),
+    "Rec_Vegetacion_A": ((0.12, 0.30, 0.08), 0.93, 1.0),
+    "Rec_Vegetacion_B": ((0.22, 0.38, 0.10), 0.93, 1.0),
     "Rec_Bloque":   ((0.48, 0.47, 0.43), 0.92, 1.0),
     "Rec_Lamina":   ((0.58, 0.62, 0.64), 0.34, 1.0),
     "Rec_Paja":     ((0.58, 0.43, 0.20), 0.95, 1.0),
@@ -842,6 +846,7 @@ def build_recinto(spec, S):
 
     prism(bm, poly, -0.6, 0.04, m_floor)                                    # piso
 
+    avoid = []                                                              # zonas ocupadas (x0,y0,x1,y1)
     water = spec.get("agua", False)
     water_radius = spec["R"] * GLOBAL_SCALE if "R" in spec else min(w, d) * 0.44
     if water:
@@ -849,6 +854,10 @@ def build_recinto(spec, S):
         ox, oy = spec.get("agua_desplazamiento", (0.0, 0.0))
         pool = [(x + ox, y + oy) for x, y in pool]
         prism(bm, pool, 0.0, 0.10, S.idx("Rec_Agua"))
+        avoid.append((
+            min(x for x, _y in pool) - 0.7, min(y for _x, y in pool) - 0.7,
+            max(x for x, _y in pool) + 0.7, max(y for _x, y in pool) + 0.7,
+        ))
         if spec.get("borde_piscina", False):
             for index, a in enumerate(pool):
                 rim_material = S.idx("Rec_Cobalto") if spec.get("domo", False) else m_curb
@@ -887,7 +896,6 @@ def build_recinto(spec, S):
     if spec.get("techo", False) and not spec.get("domo", False):           # jaula con techo plano
         prism(bm, poly, fence_h, fence_h + 0.06, S.idx("Rec_Malla"))
 
-    avoid = []                                                              # zonas ocupadas (x0,y0,x1,y1)
     if spec.get("refugio", False):
         hw = min(3.2, w * 0.35) / 2.0
         hd = 1.3
@@ -923,8 +931,71 @@ def build_recinto(spec, S):
              sx=rng.uniform(0.8, 1.3), sy=rng.uniform(0.8, 1.3))
         n_rocks -= 1
 
+    inner = scale_poly(poly, 0.78)
+    plant_count = int(spec.get(
+        "vegetacion", 2 if water else max(2, round(min(w, d) / 2.5))
+    ))
+    log_count = int(spec.get("troncos", 0 if water else 1))
+    add_habitat_natural_details(
+        bm, inner, avoid, rng, plant_count, log_count,
+        S.idx("Rec_Vegetacion_A"), S.idx("Rec_Vegetacion_B"),
+        S.idx("Rec_Tronco"),
+    )
+
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     return bm, (w, d, poly, gate)
+
+
+def add_habitat_natural_details(bm, inner, avoid, rng, plant_count, log_count,
+                                leaf_a, leaf_b, trunk):
+    """Añade arbustos bajos y troncos sin ocupar puertas, refugios ni agua."""
+    min_x, max_x = min(x for x, _y in inner), max(x for x, _y in inner)
+    min_y, max_y = min(y for _x, y in inner), max(y for _x, y in inner)
+    centers = []
+    logs = []
+
+    def available(x, y, margin):
+        if not point_in_poly(x, y, inner):
+            return False
+        if abs(x) < GATE_WIDTH / 2.0 + 0.8 and y > max_y - 2.0:
+            return False
+        if any(x0 - margin <= x <= x1 + margin and
+               y0 - margin <= y <= y1 + margin for x0, y0, x1, y1 in avoid):
+            return False
+        return True
+
+    tries = 0
+    while len(logs) < log_count and tries < log_count * 30:
+        tries += 1
+        x, y = rng.uniform(min_x, max_x), rng.uniform(min_y, max_y)
+        length = rng.uniform(1.0, 1.8)
+        angle = rng.uniform(0.0, math.pi)
+        dx, dy = math.cos(angle) * length / 2.0, math.sin(angle) * length / 2.0
+        if not all(available(px, py, 0.25) for px, py in (
+                (x - dx, y - dy), (x, y), (x + dx, y + dy))):
+            continue
+        if any(math.hypot(x - px, y - py) < 1.6 for px, py in logs):
+            continue
+        beam3d(bm, (x - dx, y - dy, 0.12), (x + dx, y + dy, 0.24), 0.16, trunk)
+        logs.append((x, y))
+
+    tries = 0
+    while len(centers) < plant_count and tries < plant_count * 40:
+        tries += 1
+        x, y = rng.uniform(min_x, max_x), rng.uniform(min_y, max_y)
+        if not available(x, y, 0.35):
+            continue
+        if any(math.hypot(x - px, y - py) < 1.45 for px, py in centers + logs):
+            continue
+
+        height = rng.uniform(0.55, 0.95)
+        radius = rng.uniform(0.28, 0.42)
+        cone(bm, x, y, 0.08, radius, 0.04, height, rng.choice((leaf_a, leaf_b)), 7)
+        cone(bm, x - radius * 0.48, y + radius * 0.32, 0.08,
+             radius * 0.68, 0.025, height * 0.72, leaf_b, 6)
+        cone(bm, x + radius * 0.48, y - radius * 0.24, 0.08,
+             radius * 0.62, 0.02, height * 0.64, leaf_a, 6)
+        centers.append((x, y))
 
 
 def bm_to_object(name, bm, S, mats, col, loc, yaw, props):
